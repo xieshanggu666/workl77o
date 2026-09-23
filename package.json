@@ -1,0 +1,34 @@
+{
+  "name": "knowledge-base-platform",
+  "version": "1.0.0",
+  "description": "团队多人知识库协作与智能问答平台",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test:gap": "mkdir -p node_modules/.cache && esbuild scripts/run-gap-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/gap-test.mjs --alias:@=./src && node node_modules/.cache/gap-test.mjs",
+    "test:restore": "mkdir -p node_modules/.cache && esbuild scripts/run-restore-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/restore-test.mjs --alias:@=./src && node node_modules/.cache/restore-test.mjs",
+    "test:perm": "mkdir -p node_modules/.cache && esbuild scripts/run-permission-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/permission-test.mjs --alias:@=./src && node node_modules/.cache/permission-test.mjs",
+    "test:share": "mkdir -p node_modules/.cache && esbuild scripts/run-share-permission-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/share-permission-test.mjs --alias:@=./src && node node_modules/.cache/share-permission-test.mjs",
+    "test:access": "mkdir -p node_modules/.cache && esbuild scripts/run-access-expiry-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/access-expiry-test.mjs --alias:@=./src && node node_modules/.cache/access-expiry-test.mjs",
+    "test:freshness": "mkdir -p node_modules/.cache && esbuild scripts/run-freshness-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/freshness-test.mjs --alias:@=./src && node node_modules/.cache/freshness-test.mjs",
+    "test:policy": "mkdir -p node_modules/.cache && esbuild scripts/run-freshness-policy-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/freshness-policy-test.mjs --alias:@=./src && node node_modules/.cache/freshness-policy-test.mjs",
+    "test:policy-migration": "mkdir -p node_modules/.cache && esbuild scripts/run-policy-migration-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/policy-migration-test.mjs --alias:@=./src && node node_modules/.cache/policy-migration-test.mjs",
+    "test:handover": "mkdir -p node_modules/.cache && esbuild scripts/run-handover-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/handover-test.mjs --alias:@=./src && node node_modules/.cache/handover-test.mjs",
+    "test:retirement": "mkdir -p node_modules/.cache && esbuild scripts/run-retirement-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/retirement-test.mjs --alias:@=./src && node node_modules/.cache/retirement-test.mjs",
+    "test:retirement-batch": "mkdir -p node_modules/.cache && esbuild scripts/run-retirement-batch-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/retirement-batch-test.mjs --alias:@=./src && node node_modules/.cache/retirement-batch-test.mjs"
+  },
+  "dependencies": {
+    "dexie": "^4.0.8",
+    "pinia": "^2.2.6",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "esbuild": "^0.25.12",
+    "fake-indexeddb": "^6.2.5",
+    "vite": "^6.0.7"
+  }
+}
