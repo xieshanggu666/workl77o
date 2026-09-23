@@ -8,6 +8,12 @@ import {
   retirementBatchStatusOf
 } from '@/utils/retirement'
 import { checkRetirementBatch } from '@/utils/retirement'
+import {
+  RETIRE_JOB_KIND, RETIRE_JOB, RETIRE_JOB_ITEM,
+  RETIRE_JOB_CHUNK_SIZE, RETIRE_JOB_MAX_ITEM_ATTEMPTS,
+  isTransientRetirementError, isJobItemRemaining, jobProgressOf, isJobResumable,
+  classifyRetirementStepResult
+} from '@/utils/retirementJob'
 import { GAP } from '@/utils/gap'
 import { isItemOpen } from '@/utils/handover'
 import { GUEST_ID, isGuestUser, ROLE } from '@/utils/permission'
@@ -24,10 +30,21 @@ import { useKbStore } from './kb'
 // 同一事务内逐篇校验（含批次内替代链冲突），任一篇不合法整体送审失败并逐行返回原因；
 // 管理员仍逐篇批准/驳回（各篇联动彼此独立），批次状态由各篇退役单派生；
 // 审批前可整体取消批次、生效后可批量撤销（逐篇独立事务，单篇失败不影响其他篇）。
-// 退役单（retirements）与其 timeline、批次（retirementBatches）、联动结果（effects）全程保留。
+// 分批编排（retirementJobs）：批量批准/批量撤销升级为可重试的分批编排任务——
+// - 任务持久化，分片逐篇独立事务执行：单篇的文档退役态/共享链接/答案来源联动原子提交，
+//   进程中断即整体回滚该篇，不产生跨文档半联动状态；
+// - 暂态失败（事务中断/配额等环境异常）就地重试；业务冲突（评审中/替代冲突/状态已变化等）
+//   隔离为篇目级冲突，不阻塞同批其他篇；
+// - 部分失败/中断可续跑：剩余篇目（含冲突、失败、执行中残留）逐篇幂等重判，已成功篇目不重复联动；
+// - 全链路留痕：批次 timeline ↔ 任务 timeline/篇目 history ↔ 退役单 timeline ↔ 链接/工单记录。
+// 退役单（retirements）与其 timeline、批次（retirementBatches）、编排任务（retirementJobs）、
+// 联动结果（effects）全程保留。
 export const useRetirementStore = defineStore('retirement', () => {
   const retirements = ref([])
   const batches = ref([])
+  const jobs = ref([])
+  // 本会话内正在执行的编排任务 id（用于停止请求与防重入；持久化状态以库中记录为准）
+  const executingJobIds = ref([])
   const loaded = ref(false)
 
   async function loadAll() {
@@ -37,9 +54,12 @@ export const useRetirementStore = defineStore('retirement', () => {
   }
 
   async function reload() {
-    const [rs, bs] = await Promise.all([db.retirements.toArray(), db.retirementBatches.toArray()])
+    const [rs, bs, js] = await Promise.all([
+      db.retirements.toArray(), db.retirementBatches.toArray(), db.retirementJobs.toArray()
+    ])
     retirements.value = rs
     batches.value = bs
+    jobs.value = js
   }
 
   const sorted = computed(() =>
@@ -91,6 +111,34 @@ export const useRetirementStore = defineStore('retirement', () => {
     for (const b of batches.value) map[b.id] = retirementBatchStatusOf(itemsOfBatch(b.id))
     return map
   })
+
+  // ---- 分批编排任务查询 ----
+
+  function jobById(jobId) {
+    return jobs.value.find((j) => j.id === jobId) || null
+  }
+
+  // 批次下的编排任务（创建时间倒序）
+  function jobsOfBatch(batchId) {
+    return jobs.value
+      .filter((j) => j.batchId === batchId)
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+  }
+
+  // 批次下某类任务的最新一条
+  function latestJobOfBatch(batchId, kind) {
+    return jobsOfBatch(batchId).find((j) => !kind || j.kind === kind) || null
+  }
+
+  // 任务是否正在本会话执行中
+  function isJobExecuting(jobId) {
+    return executingJobIds.value.includes(jobId)
+  }
+
+  // 可续跑任务（部分失败/中断/已停止且仍有剩余篇目，且未在执行中）：供全局提醒
+  const resumableJobs = computed(() =>
+    jobs.value.filter((j) => isJobResumable(j) && !isJobExecuting(j.id))
+  )
 
   function pendingApprovalFor(role) {
     if (role !== ROLE.ADMIN) return []
@@ -640,9 +688,247 @@ export const useRetirementStore = defineStore('retirement', () => {
     return result
   }
 
-  // 批次批量撤销已生效退役：逐篇独立事务调用 revokeRetirement——单篇失败（被另行处理/状态变化）
-  // 不影响同批其他篇，结果按篇聚合返回。
-  // 返回 { status:'ok', results:[{id,status,...}], done, failed } | 'denied'（无资格）
+  // ---- 分批编排执行器 ----
+
+  // 持久化任务当前快照。仅写执行器拥有的字段：stopRequested 由 stopRetirementJob 独立置位、
+  // 执行器在分片边界读取合并，双方不写同一字段，避免并发互相覆盖。
+  async function persistJob(job) {
+    await db.retirementJobs.update(job.id, {
+      status: job.status,
+      items: job.items,
+      stats: jobProgressOf(job.items),
+      timeline: job.timeline,
+      finishedAt: job.finishedAt || null,
+      updatedAt: new Date().toISOString()
+    })
+  }
+
+  // 建立编排任务并持久化（items 快照目标篇目；逐篇状态/尝试次数/留痕随执行推进）
+  async function createJob(kind, batch, targets, note, userId) {
+    const nowIso = new Date().toISOString()
+    const kindLabel = kind === RETIRE_JOB_KIND.APPROVE ? '批量批准' : '批量撤销'
+    const job = {
+      id: uid('rtj'),
+      batchId: batch.id,
+      kind,
+      status: RETIRE_JOB.RUNNING,
+      note: String(note || '').trim(),
+      initiatedBy: userId,
+      stopRequested: false,
+      items: targets.map((r) => ({
+        retirementId: r.id,
+        docId: r.docId,
+        docTitle: r.docTitle,
+        status: RETIRE_JOB_ITEM.PENDING,
+        attempts: 0,
+        lastError: '',
+        history: []
+      })),
+      stats: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      finishedAt: null,
+      timeline: [buildTimelineEntry('job-initiate', userId, kindLabel + '编排创建：共 ' + targets.length + ' 篇，分片逐篇独立事务执行', nowIso)]
+    }
+    await db.retirementJobs.add(job)
+    await reload()
+    return job
+  }
+
+  // 编排执行主循环：分片逐篇独立事务执行，暂态失败就地重试，业务冲突隔离，
+  // 片间让出事件循环并响应停止请求；任务状态全程持久化，中断后可由 resumeRetirementJob 接管。
+  // opts: { chunkSize, maxItemAttempts, chunkDelayMs, retryDelayMs, itemInterceptor(item, attempt) 测试注入 }
+  // 返回 { status: 'done' | 'partial' | 'stopped' | 'busy' | 'missing', job, summary }
+  async function executeJob(jobId, currentUser, opts = {}) {
+    if (executingJobIds.value.includes(jobId)) return { status: 'busy', job: jobById(jobId) }
+    const job = await db.retirementJobs.get(jobId)
+    if (!job) return { status: 'missing' }
+    const chunkSize = Math.max(1, opts.chunkSize || RETIRE_JOB_CHUNK_SIZE)
+    const maxItemAttempts = Math.max(1, opts.maxItemAttempts || RETIRE_JOB_MAX_ITEM_ATTEMPTS)
+    const chunkDelayMs = opts.chunkDelayMs ?? 25
+    const retryDelayMs = opts.retryDelayMs ?? 60
+    const sleep = (ms) => (ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve())
+    const nowIso = () => new Date().toISOString()
+    const operatorId = currentUser?.id || GUEST_ID
+
+    executingJobIds.value = [...executingJobIds.value, jobId]
+    try {
+      // 中断恢复：上次执行残留的「执行中」篇目重置为待执行。
+      // 单篇联动在各自事务内原子提交，中断即回滚，重判不会重复联动（幂等）。
+      for (const it of job.items) {
+        if (it.status === RETIRE_JOB_ITEM.RUNNING) it.status = RETIRE_JOB_ITEM.PENDING
+      }
+      job.status = RETIRE_JOB.RUNNING
+      await persistJob(job)
+
+      const execItem = (item) => job.kind === RETIRE_JOB_KIND.APPROVE
+        ? decideRetirement(item.retirementId, 'approve', job.note, currentUser)
+        : revokeRetirement(item.retirementId, job.note, currentUser)
+
+      let stopped = false
+      const pendings = () => job.items.filter((it) => it.status === RETIRE_JOB_ITEM.PENDING)
+      while (pendings().length) {
+        // 分片：每片 chunkSize 篇；片内逐篇独立事务（单篇故障/冲突隔离，不影响同批他篇）
+        const chunk = pendings().slice(0, chunkSize)
+        for (const item of chunk) {
+          item.status = RETIRE_JOB_ITEM.RUNNING
+          await persistJob(job)
+          for (let attempt = 1; attempt <= maxItemAttempts; attempt++) {
+            item.attempts = attempt
+            try {
+              if (opts.itemInterceptor) await opts.itemInterceptor(item, attempt)
+              const res = await execItem(item)
+              const { outcome, message } = classifyRetirementStepResult(job.kind, res)
+              item.history.push({ at: nowIso(), attempt, result: res.status, message })
+              item.status = outcome
+              item.lastError = outcome === RETIRE_JOB_ITEM.CONFLICT ? message : ''
+            } catch (err) {
+              const transient = isTransientRetirementError(err)
+              const message = err ? err.name + (err.message ? '：' + err.message : '') : '执行异常'
+              item.history.push({ at: nowIso(), attempt, result: 'error', message, transient })
+              if (transient && attempt < maxItemAttempts) {
+                // 暂态失败：就地重试（单篇事务已回滚，重试安全）
+                await persistJob(job)
+                await sleep(retryDelayMs)
+                continue
+              }
+              item.status = RETIRE_JOB_ITEM.FAILED
+              item.lastError = message
+            }
+            break
+          }
+          if (item.status === RETIRE_JOB_ITEM.RUNNING) item.status = RETIRE_JOB_ITEM.FAILED // 兜底，不应到达
+          await persistJob(job)
+        }
+        // 分片边界：合并停止请求（stopRetirementJob 仅置位 stopRequested，不并发写其他字段）
+        const fresh = await db.retirementJobs.get(jobId)
+        if (fresh?.stopRequested) { stopped = true; break }
+        if (pendings().length) await sleep(chunkDelayMs)
+      }
+
+      const stats = jobProgressOf(job.items)
+      if (stopped) {
+        job.status = RETIRE_JOB.STOPPED
+        job.timeline.push(buildTimelineEntry('job-stopped', operatorId,
+          '分片边界停止：已成功 ' + stats.succeeded + ' 篇，剩余 ' + stats.remaining + ' 篇可续跑', nowIso()))
+      } else {
+        job.status = stats.remaining ? RETIRE_JOB.PARTIAL : RETIRE_JOB.DONE
+        job.finishedAt = nowIso()
+        job.timeline.push(buildTimelineEntry('job-finish', operatorId,
+          '执行完成：成功 ' + stats.succeeded + '/' + stats.total +
+          (stats.conflict ? '，冲突隔离 ' + stats.conflict + ' 篇' : '') +
+          (stats.failed ? '，失败 ' + stats.failed + ' 篇' : ''), nowIso()))
+      }
+      await persistJob(job)
+
+      // 批次留痕：编排结论同步到批次时间线（全链路：批次 ↔ 任务 ↔ 退役单 ↔ 链接/工单）
+      const kindLabel = job.kind === RETIRE_JOB_KIND.APPROVE ? '批量批准' : '批量撤销'
+      const batchNote = kindLabel + '编排' + (stopped ? '已停止' : '完成') +
+        '：成功 ' + stats.succeeded + '/' + stats.total +
+        (stats.remaining ? '，剩余 ' + stats.remaining + ' 篇可续跑' : '') + '（任务 ' + job.id + '）'
+      await db.transaction('rw', db.retirements, db.retirementBatches, async () => {
+        await syncBatchInTx(job.batchId, buildTimelineEntry(
+          job.kind === RETIRE_JOB_KIND.APPROVE ? 'batch-approve-job' : 'batch-revoke-job',
+          operatorId, batchNote, nowIso()))
+      })
+
+      await reload()
+      return {
+        status: stopped ? 'stopped' : (stats.remaining ? 'partial' : 'done'),
+        job: await db.retirementJobs.get(jobId),
+        summary: stats
+      }
+    } finally {
+      executingJobIds.value = executingJobIds.value.filter((x) => x !== jobId)
+    }
+  }
+
+  // 批量批准编排：为批次内全部待审批篇建立可续跑编排任务并立即执行。
+  // 同一批次同类任务单例（存在未完成任务时返回 busy，应续跑而非新建，避免并发交叉）。
+  // 返回 executeJob 结果 | 'guest' | 'denied' | 'missing' | 'changed' | { status:'busy', job }
+  async function startBatchApproveJob(batchId, note, currentUser, opts = {}) {
+    await loadAll()
+    const userId = currentUser?.id || GUEST_ID
+    if (isGuestUser(userId)) return { status: 'guest' }
+    if (currentUser?.role !== ROLE.ADMIN) return { status: 'denied' }
+    const batch = batchById(batchId)
+    if (!batch) return { status: 'missing' }
+    const live = jobs.value.find((j) =>
+      j.batchId === batchId && j.kind === RETIRE_JOB_KIND.APPROVE &&
+      (isJobResumable(j) || isJobExecuting(j.id)))
+    if (live) return { status: 'busy', job: live }
+    const targets = itemsOfBatch(batchId).filter((r) => isRetirementOpen(r))
+    if (!targets.length) return { status: 'changed', results: [] }
+    const job = await createJob(RETIRE_JOB_KIND.APPROVE, batch, targets, note, userId)
+    return executeJob(job.id, currentUser, opts)
+  }
+
+  // 批量撤销编排：为批次内全部已生效篇建立可续跑编排任务并立即执行（逐篇独立事务恢复）。
+  async function startBatchRevokeJob(batchId, note, currentUser, opts = {}) {
+    await loadAll()
+    const userId = currentUser?.id || GUEST_ID
+    if (isGuestUser(userId)) return { status: 'guest' }
+    const batch = batchById(batchId)
+    if (!batch) return { status: 'missing' }
+    if (batch.initiatedBy !== userId && currentUser?.role !== ROLE.ADMIN) return { status: 'denied' }
+    const live = jobs.value.find((j) =>
+      j.batchId === batchId && j.kind === RETIRE_JOB_KIND.REVOKE &&
+      (isJobResumable(j) || isJobExecuting(j.id)))
+    if (live) return { status: 'busy', job: live }
+    const targets = itemsOfBatch(batchId).filter((r) => isRetirementActive(r))
+    if (!targets.length) return { status: 'changed', results: [] }
+    const job = await createJob(RETIRE_JOB_KIND.REVOKE, batch, targets, note, userId)
+    return executeJob(job.id, currentUser, opts)
+  }
+
+  // 续跑：剩余篇目（待执行/冲突/失败/中断残留）重置为待执行后重新分片执行。
+  // 逐篇幂等重判——已处目标态的篇目记为成功且不重复联动；已成功篇目不参与续跑。
+  async function resumeRetirementJob(jobId, currentUser, opts = {}) {
+    await loadAll()
+    const userId = currentUser?.id || GUEST_ID
+    if (isGuestUser(userId)) return { status: 'guest' }
+    const job = await db.retirementJobs.get(jobId)
+    if (!job) return { status: 'missing' }
+    if (job.kind === RETIRE_JOB_KIND.APPROVE) {
+      if (currentUser?.role !== ROLE.ADMIN) return { status: 'denied' }
+    } else if (job.initiatedBy !== userId && currentUser?.role !== ROLE.ADMIN) {
+      return { status: 'denied' }
+    }
+    if (executingJobIds.value.includes(jobId)) return { status: 'busy', job }
+    const remaining = job.items.filter((it) => isJobItemRemaining(it))
+    if (!remaining.length) return { status: 'done', job, summary: jobProgressOf(job.items) }
+    const nowIso = new Date().toISOString()
+    for (const it of job.items) {
+      if (isJobItemRemaining(it)) {
+        it.status = RETIRE_JOB_ITEM.PENDING
+        it.lastError = ''
+      }
+    }
+    job.status = RETIRE_JOB.RUNNING
+    job.stopRequested = false
+    job.timeline = [...(job.timeline || []), buildTimelineEntry('job-resume', userId,
+      '续跑剩余 ' + remaining.length + ' 篇（冲突/失败篇目重新判定）', nowIso)]
+    // 任务未在执行中，整体写回安全（含清除 stopRequested）
+    await db.retirementJobs.put(job)
+    return executeJob(jobId, currentUser, opts)
+  }
+
+  // 请求停止：仅置位 stopRequested，执行器在当前分片结束后停止（剩余篇目可续跑）
+  async function stopRetirementJob(jobId, currentUser) {
+    await loadAll()
+    const userId = currentUser?.id || GUEST_ID
+    if (isGuestUser(userId)) return { status: 'guest' }
+    const job = await db.retirementJobs.get(jobId)
+    if (!job) return { status: 'missing' }
+    if (job.initiatedBy !== userId && currentUser?.role !== ROLE.ADMIN) return { status: 'denied' }
+    if (!executingJobIds.value.includes(jobId)) return { status: 'changed', job }
+    await db.retirementJobs.update(jobId, { stopRequested: true })
+    return { status: 'ok' }
+  }
+
+  // 批次批量撤销已生效退役（兼容入口）：内部升级为可重试分批编排——逐篇独立事务、
+  // 暂态失败重试、业务冲突隔离、部分失败可续跑；返回保持逐篇聚合结构。
+  // 返回 { status:'ok', results:[{id,status,...}], done, failed, job } | 'denied'（无资格）
   async function revokeRetirementBatch(batchId, note, currentUser) {
     await loadAll()
     const userId = currentUser?.id || GUEST_ID
@@ -653,12 +939,23 @@ export const useRetirementStore = defineStore('retirement', () => {
     if (batch.initiatedBy !== userId && role !== ROLE.ADMIN) return { status: 'denied' }
     const targets = itemsOfBatch(batchId).filter((r) => isRetirementActive(r))
     if (!targets.length) return { status: 'changed', results: [] }
-    const results = []
-    for (const r of targets) {
-      // 逐篇独立事务：某篇撤销失败不回滚其他篇（与逐篇批准的独立性一致）
-      results.push(await revokeRetirement(r.id, note, currentUser))
+    const res = await startBatchRevokeJob(batchId, note, currentUser)
+    if (res.status === 'busy' || res.status === 'missing' || res.status === 'denied' || res.status === 'guest') {
+      return { status: res.status, results: [], job: res.job }
     }
-    return { status: 'ok', results, done: results.filter((x) => x.status === 'ok').length, failed: results.filter((x) => x.status !== 'ok').length }
+    const items = res.job?.items || []
+    const results = items.map((it) => ({
+      id: it.retirementId,
+      status: it.status === RETIRE_JOB_ITEM.SUCCEEDED ? 'ok' : 'conflict',
+      jobItem: it
+    }))
+    return {
+      status: 'ok',
+      results,
+      done: results.filter((x) => x.status === 'ok').length,
+      failed: results.filter((x) => x.status !== 'ok').length,
+      job: res.job
+    }
   }
 
   // 我发起的批次
@@ -674,15 +971,18 @@ export const useRetirementStore = defineStore('retirement', () => {
   }
 
   return {
-    retirements, batches, loaded, loadAll, reload, sorted, sortedBatches,
+    retirements, batches, jobs, loaded, loadAll, reload, sorted, sortedBatches,
     openRetirementOfDoc, activeRetirementOfDoc, activeRetirementUsingAsReplacement,
     openRetirementUsingAsReplacement, retirementUsingAsReplacement,
     batchById, itemsOfBatch, batchStatusById,
+    jobById, jobsOfBatch, latestJobOfBatch, isJobExecuting, resumableJobs,
     pendingApprovalFor, initiatedBy, involvedIn, pendingCountFor,
     batchesInitiatedBy, batchesInvolvedIn,
     initiateRetirement, initiateRetirementBatch,
     cancelRetirement, cancelRetirementBatch,
     decideRetirement,
-    revokeRetirement, revokeRetirementBatch
+    revokeRetirement, revokeRetirementBatch,
+    startBatchApproveJob, startBatchRevokeJob,
+    resumeRetirementJob, stopRetirementJob
   }
 })

@@ -9,6 +9,7 @@ import {
 } from '@/utils/retirement'
 import RetirementCard from '@/components/doc/RetirementCard.vue'
 import RetirementBatchDialog from '@/components/doc/RetirementBatchDialog.vue'
+import RetirementJobPanel from '@/components/doc/RetirementJobPanel.vue'
 
 const kb = useKbStore()
 const auth = useAuthStore()
@@ -97,15 +98,38 @@ async function cancelBatch(batch) {
   }
 }
 
+async function approveBatch(batch) {
+  if (batchBusy.value) return
+  const pendingCount = retirementStore.itemsOfBatch(batch.id).filter((r) => r.status === 'pending').length
+  if (!pendingCount) { alert('该批次已无待审批篇。'); return }
+  if (!confirm('确定批量批准该批次的 ' + pendingCount + ' 篇待审批退役？将分批逐篇生效（停止搜索/问答引用、撤销共享链接、答案来源改挂替代文档）；单篇冲突/失败不影响其他篇，可在任务面板续跑。')) return
+  batchBusy.value = batch.id
+  try {
+    const res = await retirementStore.startBatchApproveJob(batch.id, '', auth.user)
+    if (res.status === 'done') alert('批量批准完成：全部 ' + res.summary.total + ' 篇已退役生效。')
+    else if (res.status === 'partial') alert('批量批准部分完成：成功 ' + res.summary.succeeded + ' 篇，' + res.summary.remaining + ' 篇冲突/失败（详见批次任务面板，处理后可续跑）。')
+    else if (res.status === 'stopped') alert('批量批准已停止，剩余篇目可在任务面板续跑。')
+    else if (res.status === 'busy') alert('该批次已存在未完成的批量批准任务，请在下方任务面板续跑。')
+    else if (res.status === 'changed') alert('该批次已无待审批篇。')
+    else if (res.status === 'denied') alert('只有管理员可以批量批准。')
+    else alert('操作失败')
+  } finally {
+    batchBusy.value = ''
+  }
+}
+
 async function revokeBatch(batch) {
   if (batchBusy.value) return
   const activeCount = retirementStore.itemsOfBatch(batch.id).filter((r) => isRetirementActive(r)).length
   if (!activeCount) { alert('该批次已无生效中的退役。'); return }
-  if (!confirm('确定批量撤销该批次的 ' + activeCount + ' 篇已生效退役？将逐篇恢复搜索/问答引用、共享链接与答案来源（单篇被另行处理时不影响其他篇）。')) return
+  if (!confirm('确定批量撤销该批次的 ' + activeCount + ' 篇已生效退役？将分批逐篇恢复搜索/问答引用、共享链接与答案来源；单篇被另行处理不影响其他篇，可在任务面板续跑。')) return
   batchBusy.value = batch.id
   try {
-    const res = await retirementStore.revokeRetirementBatch(batch.id, (batchNoteMap.value[batch.id] || '').trim(), auth.user)
-    if (res.status === 'ok') alert('批量撤销完成：成功 ' + res.done + ' 篇' + (res.failed ? '，' + res.failed + ' 篇因状态变化未撤销' : ''))
+    const res = await retirementStore.startBatchRevokeJob(batch.id, (batchNoteMap.value[batch.id] || '').trim(), auth.user)
+    if (res.status === 'done') alert('批量撤销完成：全部 ' + res.summary.total + ' 篇已恢复。')
+    else if (res.status === 'partial') alert('批量撤销部分完成：成功 ' + res.summary.succeeded + ' 篇，' + res.summary.remaining + ' 篇冲突/失败（详见批次任务面板，处理后可续跑）。')
+    else if (res.status === 'stopped') alert('批量撤销已停止，剩余篇目可在任务面板续跑。')
+    else if (res.status === 'busy') alert('该批次已存在未完成的批量撤销任务，请在下方任务面板续跑。')
     else if (res.status === 'denied') alert('只有批次发起人或管理员可以批量撤销。')
     else if (res.status === 'changed') alert('该批次已无生效中的退役。')
     else alert('操作失败')
@@ -133,10 +157,14 @@ onMounted(async () => {
         <button class="btn sm primary batch-btn" @click="showBatchDialog = true">📦 批量退役 · 统一送审</button>
       </div>
       <p class="sub">
-        负责人可一次为多篇文档<b>分别指定替代文档并统一送审</b>，管理员<b>逐篇批准</b>；
+        负责人可一次为多篇文档<b>分别指定替代文档并统一送审</b>，管理员<b>逐篇或批量批准</b>；
         审批通过后逐篇停止旧文档的搜索与问答引用、撤销其共享链接，并把已解决缺口工单的答案来源改挂对应替代文档；
-        替代文档无权限时可申请访问。退役可逐篇或按批撤销，共享链接与答案来源同步恢复，全程留痕。
+        替代文档无权限时可申请访问。批量批准/撤销以<b>可重试的分批编排</b>执行：单篇冲突/失败不影响其他篇，
+        部分失败可续跑，共享链接与答案来源同步恢复，全程留痕。
       </p>
+      <div v-if="retirementStore.resumableJobs.length" class="resume-banner">
+        ⚠️ 有 {{ retirementStore.resumableJobs.length }} 个退役编排任务存在未完成篇目（部分失败/中断/已停止），可在对应批次的任务面板中续跑。
+      </div>
       <div class="tabs">
         <button v-if="auth.user?.role === 'admin'" :class="{ on: tab === 'approve' }" @click="tab = 'approve'">待审批 <em>{{ counts.approve }}</em></button>
         <button :class="{ on: tab === 'mine' }" @click="tab = 'mine'">我发起的 <em>{{ counts.mine }}</em></button>
@@ -164,6 +192,7 @@ onMounted(async () => {
           <div class="bg-meta">
             <span>{{ userName(g.batch.initiatedBy) }} 发起 · {{ formatDate(g.batch.createdAt) }}</span>
             <div v-if="canManageBatch(g.batch)" class="bg-acts">
+              <button v-if="auth.user?.role === 'admin' && progressOf(g.items).pending" class="btn xs ok-solid" :disabled="batchBusy === g.batch.id" @click="approveBatch(g.batch)">批量批准待审批篇（{{ progressOf(g.items).pending }}）</button>
               <button v-if="progressOf(g.items).pending" class="btn xs ghost" :disabled="batchBusy === g.batch.id" @click="cancelBatch(g.batch)">整体取消待审批篇</button>
               <template v-if="progressOf(g.items).approved">
                 <input v-model="batchNoteMap[g.batch.id]" class="bg-note" placeholder="批量撤销说明（可选）" />
@@ -185,6 +214,9 @@ onMounted(async () => {
         <div class="bg-items">
           <RetirementCard v-for="r in g.items" :key="r.id" :r="r" compact />
         </div>
+
+        <!-- 分批编排任务面板：批量批准/撤销的执行进度、逐篇结果、续跑/停止 -->
+        <RetirementJobPanel :batch="g.batch" />
 
         <details class="bg-tl">
           <summary>批次操作记录（{{ (g.batch.timeline || []).length }}）</summary>
@@ -213,6 +245,9 @@ onMounted(async () => {
 .btn.primary:hover { filter: brightness(1.05); color: #fff; }
 .btn.xs { font-size: 12px; padding: 4px 10px; }
 .sub { color: var(--text-2); font-size: 13px; margin: 8px 0 14px; line-height: 1.7; }
+.resume-banner { margin: 0 0 12px; padding: 10px 14px; border-radius: 10px; background: #fffbeb; border: 1px solid #fde68a; color: #b45309; font-size: 13px; }
+.btn.ok-solid { background: #16a34a; border-color: #16a34a; color: #fff; }
+.btn.ok-solid:hover { background: #15803d; color: #fff; }
 .tabs { display: flex; gap: 8px; }
 .tabs button { border: 1px solid var(--border); background: var(--panel); padding: 7px 16px; border-radius: 999px; cursor: pointer; font-size: 13px; color: var(--text-2); }
 .tabs button.on { background: var(--primary); border-color: var(--primary); color: #fff; font-weight: 600; }
