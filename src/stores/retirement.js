@@ -8,6 +8,9 @@ import {
   retirementBatchStatusOf
 } from '@/utils/retirement'
 import { checkRetirementBatch } from '@/utils/retirement'
+import {
+  registerBatchHandler, ITEM
+} from '@/utils/orchestration'
 import { GAP } from '@/utils/gap'
 import { isItemOpen } from '@/utils/handover'
 import { GUEST_ID, isGuestUser, ROLE } from '@/utils/permission'
@@ -20,10 +23,16 @@ import { useKbStore } from './kb'
 // - 已解决缺口工单（resolved、答案来源指向旧文档）的 docId 改挂替代文档并逐条留痕；
 // 管理员可逐篇驳回（rejected）、发起人审批前可撤销（cancelled）；退役生效后发起人/管理员可撤销退役
 // （revoked）：同事务恢复搜索/问答引用、恢复被本次退役撤销的共享链接、答案来源回挂旧文档。
-// 批量送审：负责人可一次为多篇文档分别指定替代文档（retirementBatches 批次挂 N 张退役单），
-// 同一事务内逐篇校验（含批次内替代链冲突），任一篇不合法整体送审失败并逐行返回原因；
-// 管理员仍逐篇批准/驳回（各篇联动彼此独立），批次状态由各篇退役单派生；
-// 审批前可整体取消批次、生效后可批量撤销（逐篇独立事务，单篇失败不影响其他篇）。
+//
+// 可重试分批编排（batchJobs/batchJobItems，见 utils/batch-runner.js）：
+// - 批量送审（retirement.batch-submit）：预检不合法的行在对话框拦截；合法行逐篇独立事务建档退役单，
+//   单篇被并发占用只隔离该篇（冲突隔离），失败篇外部条件解除后可只重试失败篇；
+// - 批量批准（retirement.batch-approve）：对批次内待审批篇逐篇独立事务执行批准联动
+//   （停引用/撤共享链接/改挂缺口答案来源），冲突篇隔离、成功篇生效，可续跑重试；
+// - 批量撤销恢复（retirement.batch-revoke）：逐篇独立事务恢复搜索引用/共享链接/答案来源，
+//   退役期间被另行处理的篇不强行回滚、仅标记跳过。
+// 作业状态、逐篇尝试（attempts）、心跳租约、中止标志全程入库，崩溃后凭心跳断点续跑；
+// 批次 timeline 与作业 timeline 双向留痕，避免编排作业与退役批次状态不一致。
 // 退役单（retirements）与其 timeline、批次（retirementBatches）、联动结果（effects）全程保留。
 export const useRetirementStore = defineStore('retirement', () => {
   const retirements = ref([])
@@ -205,13 +214,79 @@ export const useRetirementStore = defineStore('retirement', () => {
     })
   }
 
-  // 批量送审：一次为多篇文档分别指定替代文档并统一送审。
+  // 事务内批量预检：复用 checkRetirementBatch 全部规则（归属/替代合法性/评审交接占用/
+  // 文档间替代冲突/同批替代链）。返回 { rows, docs }；rows 逐行带 error/title。
+  // 供批量送审编排（预检拦截）与 setup 共用，规则只保留一处。
+  async function checkBatchRowsInTx(cleanRows, userId, role) {
+    const docCache = {}
+    const docOf = async (id) => {
+      if (!(id in docCache)) docCache[id] = await db.docs.get(id)
+      return docCache[id]
+    }
+    const docs = {}
+    for (const row of cleanRows) {
+      docs[row.docId] = await docOf(row.docId)
+      if (row.replacementDocId) docs[row.replacementDocId] = await docOf(row.replacementDocId)
+    }
+    const allRetirements = await db.retirements.toArray()
+    const openCache = new Map()
+    const activeCache = new Map()
+    const openRepCache = new Map()
+    const activeRepCache = new Map()
+    const reviewCache = new Map()
+    const handoverCache = new Map()
+    const openRetirementOfDocTx = (id) => {
+      if (!openCache.has(id)) openCache.set(id, allRetirements.find((r) => isRetirementOpen(r) && r.docId === id) || null)
+      return openCache.get(id)
+    }
+    const activeRetirementOfDocTx = (id) => {
+      if (!activeCache.has(id)) activeCache.set(id, allRetirements.find((r) => isRetirementActive(r) && r.docId === id) || null)
+      return activeCache.get(id)
+    }
+    const openUsingAsReplacement = (id) => {
+      if (!openRepCache.has(id)) openRepCache.set(id, allRetirements.find((r) => isRetirementOpen(r) && r.replacementDocId === id) || null)
+      return openRepCache.get(id)
+    }
+    const activeUsingAsReplacement = (id) => {
+      if (!activeRepCache.has(id)) activeRepCache.set(id, allRetirements.find((r) => isRetirementActive(r) && r.replacementDocId === id) || null)
+      return activeRepCache.get(id)
+    }
+    const allOldIds = [...new Set(cleanRows.map((x) => x.docId))]
+    await Promise.all(allOldIds.map(async (id) => {
+      const [rv, ho] = await Promise.all([
+        db.reviews.where('docId').equals(id).filter((x) => x.status === 'pending').first(),
+        db.handovers.filter((h) => (h.items || []).some((i) => i.docId === id && isItemOpen(i))).first()
+      ])
+      reviewCache.set(id, rv || null)
+      handoverCache.set(id, ho || null)
+    }))
+    const checked = checkRetirementBatch(cleanRows, {
+      docOf: (id) => docs[id] || null,
+      userId, role,
+      openRetirementOfDoc: openRetirementOfDocTx,
+      activeRetirementOfDoc: activeRetirementOfDocTx,
+      openUsingAsReplacement, activeUsingAsReplacement,
+      pendingReviewOfDoc: (id) => reviewCache.get(id) || null,
+      openHandoverOfDoc: (id) => handoverCache.get(id) || null
+    })
+    // 归属复核（checkRetirementBatch 的 ctx 未带权限信息，统一在此判定）
+    for (const row of checked.rows) {
+      const doc = docs[row.docId]
+      if (doc && doc.ownerId !== userId && role !== ROLE.ADMIN) row.error = 'denied'
+    }
+    return { rows: checked.rows, docs }
+  }
+
+  // 批量送审（可重试分批编排）：一次为多篇文档分别指定替代文档并统一送审。
   // rows: [{ docId, replacementDocId, reason? }]；note 为批次级统一退役原因（篇级 reason 可选覆盖）
-  // 同一事务内逐篇复核归属、替代合法性、评审/交接占用与文档间替代冲突（含同批成链），
-  // 任一篇不合法 → 整体送审失败（不产生任何退役单），逐行返回原因供发起人调整。
-  // 返回 { status:'ok', batch, retirements } | 'guest' | 'no-docs'
-  //      | { status:'invalid', rows: checkRetirementBatch 结果 }
+  // ① 预检：同一事务内逐篇复核（含批次内替代链冲突）；全部不合法 → 返回 invalid 逐行标红，不建档；
+  // ② 合法行进入编排作业：逐篇独立事务建立退役单，单篇被并发占用只隔离该篇（冲突隔离），
+  //    批次单与作业同一事务原子建档；失败篇外部条件解除后可只重试失败篇（部分失败续跑）。
+  // 返回 { status:'ok'|'partial', job, batch, items, retirements, invalid:[] }
+  //      | 'guest' | 'no-docs' | { status:'invalid', rows }（全部/部分行预检失败时 rows 为全部行）
   async function initiateRetirementBatch({ rows, note }, currentUser) {
+    const { useOrchestrationStore } = await import('./orchestration')
+    const orchestration = useOrchestrationStore()
     const kb = useKbStore()
     await kb.loadAll()
     await loadAll()
@@ -220,132 +295,140 @@ export const useRetirementStore = defineStore('retirement', () => {
     const role = currentUser?.role || null
     const cleanRows = (rows || []).filter((x) => x && x.docId)
     if (!cleanRows.length) return { status: 'no-docs' }
-    const nowIso = new Date().toISOString()
     const batchNote = String(note || '').trim()
-    let result = { status: 'error' }
 
-    await db.transaction(
-      'rw',
-      db.docs, db.retirements, db.retirementBatches, db.reviews, db.handovers,
-      async () => {
-        // 事务内统一读出校验上下文，逐篇复核以库中最新数据为准
-        const docCache = {}
-        const docOf = async (id) => {
-          if (!(id in docCache)) docCache[id] = await db.docs.get(id)
-          return docCache[id]
-        }
-        const docs = {}
-        for (const row of cleanRows) {
-          docs[row.docId] = await docOf(row.docId)
-          if (row.replacementDocId) docs[row.replacementDocId] = await docOf(row.replacementDocId)
-        }
-        // 退役占用判断直接读库（非内存快照），保证事务内看到其他窗口已提交的最新在途/生效单
-        const allRetirements = await db.retirements.toArray()
-        const openCache = new Map()
-        const activeCache = new Map()
-        const openRepCache = new Map()
-        const activeRepCache = new Map()
-        const reviewCache = new Map()
-        const handoverCache = new Map()
-        const openRetirementOfDoc = (id) => {
-          if (!openCache.has(id)) openCache.set(id, allRetirements.find((r) => isRetirementOpen(r) && r.docId === id) || null)
-          return openCache.get(id)
-        }
-        const activeRetirementOfDoc = (id) => {
-          if (!activeCache.has(id)) activeCache.set(id, allRetirements.find((r) => isRetirementActive(r) && r.docId === id) || null)
-          return activeCache.get(id)
-        }
-        const openUsingAsReplacement = (id) => {
-          if (!openRepCache.has(id)) openRepCache.set(id, allRetirements.find((r) => isRetirementOpen(r) && r.replacementDocId === id) || null)
-          return openRepCache.get(id)
-        }
-        const activeUsingAsReplacement = (id) => {
-          if (!activeRepCache.has(id)) activeRepCache.set(id, allRetirements.find((r) => isRetirementActive(r) && r.replacementDocId === id) || null)
-          return activeRepCache.get(id)
-        }
-        // 评审/交接占用：事务内预取全部待退役文档的最新状态，checkRetirementBatch 按同步 Map 查询
-        const allOldIds = [...new Set(cleanRows.map((x) => x.docId))]
-        await Promise.all(allOldIds.map(async (id) => {
-          const [rv, ho] = await Promise.all([
-            db.reviews.where('docId').equals(id).filter((x) => x.status === 'pending').first(),
-            db.handovers.filter((h) => (h.items || []).some((i) => i.docId === id && isItemOpen(i))).first()
-          ])
-          reviewCache.set(id, rv || null)
-          handoverCache.set(id, ho || null)
-        }))
-        const pendingReviewOfDoc = (id) => reviewCache.get(id) || null
-        const openHandoverOfDoc = (id) => handoverCache.get(id) || null
-
-        const checked = checkRetirementBatch(cleanRows, {
-          docOf: (id) => docs[id] || null,
-          userId, role,
-          openRetirementOfDoc, activeRetirementOfDoc,
-          openUsingAsReplacement, activeUsingAsReplacement,
-          pendingReviewOfDoc, openHandoverOfDoc
-        })
-        if (checked.rows.some((r) => r.error)) { result = { status: 'invalid', rows: checked.rows }; return }
-
-        // 归属复核（checkRetirementBatch 的 ctx 未带权限信息，统一在此判定）
-        for (const row of checked.rows) {
-          const doc = docs[row.docId]
-          if (doc.ownerId !== userId && role !== ROLE.ADMIN) {
-            row.error = 'denied'
-          }
-        }
-        if (checked.rows.some((r) => r.error)) { result = { status: 'invalid', rows: checked.rows }; return }
-
-        const batchId = uid('rtb')
-        const created = []
-        for (let i = 0; i < checked.rows.length; i++) {
-          const row = checked.rows[i]
-          const doc = docs[row.docId]
-          const replacement = docs[row.replacementDocId]
-          const reason = row.reason || batchNote
-          const retirement = {
-            id: uid('rt'),
-            status: RETIRE.PENDING,
-            docId: doc.id,
-            docTitle: doc.title,
-            replacementDocId: replacement.id,
-            replacementTitle: replacement.title,
-            replacementOwnerId: replacement.ownerId,
-            initiatedBy: userId,
-            reason,
-            createdAt: nowIso,
-            decidedBy: null,
-            decidedAt: null,
-            decideNote: '',
-            approvedAt: null,
-            revokedBy: null,
-            revokedAt: null,
-            revokeNote: '',
-            batchId,
-            batchIndex: i,
-            effects: null,
-            timeline: [buildTimelineEntry('batch-submit', userId, '随批次 ' + batchId + ' 统一送审' + (reason ? '：' + reason : ''), nowIso)]
-          }
-          await db.retirements.add(retirement)
-          created.push(retirement)
-        }
-
-        const batch = {
-          id: batchId,
-          status: RETIRE_BATCH.ACTIVE,
-          initiatedBy: userId,
-          total: created.length,
-          note: batchNote,
-          docIds: created.map((r) => r.docId),
-          createdAt: nowIso,
-          updatedAt: nowIso,
-          resolvedAt: null,
-          timeline: [buildTimelineEntry('initiate', userId, '统一送审 ' + created.length + ' 篇' + (batchNote ? '：' + batchNote : ''), nowIso)]
-        }
-        await db.retirementBatches.add(batch)
-        result = { status: 'ok', batch, retirements: created }
-      }
+    // 预检事务：以库中最新数据逐行判定
+    const { rows: checkedRows } = await db.transaction(
+      'r',
+      db.docs, db.retirements, db.reviews, db.handovers,
+      async () => checkBatchRowsInTx(cleanRows, userId, role)
     )
+    const invalid = checkedRows.filter((r) => r.error)
+    const valid = checkedRows.filter((r) => !r.error)
+    if (!valid.length) return { status: 'invalid', rows: checkedRows }
+
+    const batchId = uid('rtb')
+    const enqueue = await orchestration.enqueueAndRun({
+      module: 'retirement',
+      action: 'batch-submit',
+      refId: batchId,
+      refType: 'retirementBatch',
+      title: '批量退役统一送审',
+      note: batchNote,
+      createdBy: userId,
+      actor: currentUser || null,
+      partial: invalid.length > 0,
+      setupPayload: { batchId, batchNote, userId },
+      items: valid.map((row, i) => ({
+        key: row.docId,
+        entityId: row.docId,
+        title: row.title,
+        payload: {
+          batchIndex: i,
+          docId: row.docId,
+          replacementDocId: row.replacementDocId,
+          reason: row.reason || batchNote
+        }
+      }))
+    })
 
     await reload()
+    await orchestration.reload()
+    const jobItems = orchestration.itemsOf(enqueue.job.id)
+    const retirements = itemsOfBatch(batchId)
+    return {
+      status: invalid.length ? 'partial' : 'ok',
+      job: enqueue.job,
+      batch: batchById(batchId),
+      items: jobItems,
+      retirements,
+      invalid,
+      rows: checkedRows
+    }
+  }
+
+  // 编排作业 · 单篇送审执行器（幂等）：独立事务内按库中最新数据复核并建立退役单。
+  // 续跑重放时若该篇退役单已建立则返回 skipped；冲突返回对应状态码（作业标记 failed 供解除后续跑）。
+  async function runBatchSubmitItem(item, ctx) {
+    const nowIso = new Date().toISOString()
+    let result = { status: 'error' }
+    await db.transaction('rw', db.docs, db.retirements, db.retirementBatches, db.reviews, db.handovers, async () => {
+      const { docId, replacementDocId, reason, batchIndex } = item.payload
+      // 幂等：同一批次已为该文档建立在途/任意退役单（重放、重复提交）
+      const existed = await db.retirements
+        .filter((r) => r.batchId === ctx.job.refId && r.docId === docId).first()
+      if (existed) { result = { status: 'skipped', retirement: existed }; return }
+
+      const doc = await db.docs.get(docId)
+      if (!doc) { result = { status: 'missing' }; return }
+      const batch = await db.retirementBatches.get(ctx.job.refId)
+      const initiatorId = ctx.job.createdBy
+      // 角色取真实 actor（建档时由 UI 传入；续跑时 actorOf 从 users 表还原），不凭作业身份提权
+      if (doc.ownerId !== initiatorId && ctx.actor?.role !== ROLE.ADMIN) { result = { status: 'denied', title: doc.title }; return }
+      if (doc.retirement?.status === RETIRE.APPROVED) { result = { status: 'in-retirement', title: doc.title }; return }
+      const dup = await db.retirements.filter((r) => isRetirementOpen(r) && r.docId === docId).first()
+      if (dup) { result = { status: 'in-retirement', title: doc.title }; return }
+      const usedActive = await db.retirements
+        .filter((r) => isRetirementActive(r) && r.replacementDocId === docId).first()
+      const usedOpen = await db.retirements
+        .filter((r) => isRetirementOpen(r) && r.replacementDocId === docId).first()
+      if (usedActive || usedOpen) { result = { status: 'used-as-replacement', title: (usedActive || usedOpen).docTitle || doc.title }; return }
+
+      const replacement = await db.docs.get(replacementDocId)
+      if (!replacement || replacementDocId === docId) { result = { status: 'bad-replacement' }; return }
+      if (replacement.retirement?.status === RETIRE.APPROVED) { result = { status: 'replacement-retired', title: replacement.title }; return }
+      const repOpen = await db.retirements.filter((r) => isRetirementOpen(r) && r.docId === replacementDocId).first()
+      if (repOpen) { result = { status: 'replacement-retired', title: replacement.title }; return }
+      // 同批替代链兜底（预检后并发加入的场景也拦住）
+      const inBatchRep = await db.retirements
+        .filter((r) => r.batchId === ctx.job.refId && r.docId === replacementDocId).first()
+      if (inBatchRep) { result = { status: 'replacement-in-batch', title: replacement.title }; return }
+
+      const pendingReview = await db.reviews
+        .where('docId').equals(docId).filter((rv) => rv.status === 'pending').first()
+      if (pendingReview) { result = { status: 'in-review', title: doc.title }; return }
+      const handover = await db.handovers
+        .filter((h) => (h.items || []).some((i) => i.docId === docId && isItemOpen(i))).first()
+      if (handover) { result = { status: 'in-handover', title: doc.title }; return }
+
+      const retirement = {
+        id: uid('rt'),
+        status: RETIRE.PENDING,
+        docId,
+        docTitle: doc.title,
+        replacementDocId: replacement.id,
+        replacementTitle: replacement.title,
+        replacementOwnerId: replacement.ownerId,
+        initiatedBy: initiatorId,
+        reason: reason || batch?.note || '',
+        createdAt: nowIso,
+        decidedBy: null,
+        decidedAt: null,
+        decideNote: '',
+        approvedAt: null,
+        revokedBy: null,
+        revokedAt: null,
+        revokeNote: '',
+        batchId: ctx.job.refId,
+        batchIndex,
+        effects: null,
+        timeline: [buildTimelineEntry('batch-submit', initiatorId,
+          '随批次 ' + ctx.job.refId + ' 编排送审（作业 ' + ctx.job.id + '）' + (reason ? '：' + reason : ''), nowIso)]
+      }
+      await db.retirements.add(retirement)
+      // 批次 total 随实际建档篇数物化（预检拦截的行不计入批次）
+      if (batch) {
+        const items = await db.retirements.where('batchId').equals(batch.id).toArray()
+        batch.total = items.length
+        batch.docIds = items.map((r) => r.docId)
+        batch.updatedAt = nowIso
+        await db.retirementBatches.put(batch)
+      }
+      result = { status: 'ok', retirement }
+    })
+    const kb = useKbStore()
+    const { useGapStore } = await import('./gap')
+    await Promise.all([reload(), kb.reloadDocs(), useGapStore().reload()])
     return result
   }
 
@@ -640,10 +723,67 @@ export const useRetirementStore = defineStore('retirement', () => {
     return result
   }
 
-  // 批次批量撤销已生效退役：逐篇独立事务调用 revokeRetirement——单篇失败（被另行处理/状态变化）
-  // 不影响同批其他篇，结果按篇聚合返回。
-  // 返回 { status:'ok', results:[{id,status,...}], done, failed } | 'denied'（无资格）
+  // 批量批准（可重试分批编排）：对批次内所有仍在待审批的退役单逐篇独立事务执行批准联动
+  // （同篇内：停搜索/问答引用 → 撤销有效共享链接 → 改挂已解决缺口工单答案来源）。
+  // 审批期间某篇出现并发冲突（被他单占用替代/进入评审交接/替代文档退役）只隔离该篇，
+  // 成功篇照常生效；冲突解除后可在作业面板只重试失败篇（部分失败续跑）。
+  // 返回 { status:'ok'|'partial'|'failed'|'changed'|'denied'|'missing'|'guest', job?, results }
+  async function decideRetirementBatch(batchId, note, currentUser) {
+    const { useOrchestrationStore } = await import('./orchestration')
+    const orchestration = useOrchestrationStore()
+    await loadAll()
+    const userId = currentUser?.id || GUEST_ID
+    if (isGuestUser(userId)) return { status: 'guest' }
+    if (currentUser?.role !== ROLE.ADMIN) return { status: 'denied' }
+    const batch = batchById(batchId)
+    if (!batch) return { status: 'missing' }
+    const targets = itemsOfBatch(batchId).filter((r) => isRetirementOpen(r))
+    if (!targets.length) return { status: 'changed', results: [] }
+    const decideNote = String(note || '').trim()
+
+    const enqueue = await orchestration.enqueueAndRun({
+      module: 'retirement',
+      action: 'batch-approve',
+      refId: batchId,
+      refType: 'retirementBatch',
+      title: '批量批准退役（逐篇联动生效）',
+      note: decideNote,
+      createdBy: userId,
+      actor: currentUser || null,
+      setupPayload: { batchId, userId, decision: 'approve', note: decideNote },
+      items: targets.map((r) => ({
+        key: r.id,
+        entityId: r.docId,
+        title: r.docTitle,
+        payload: { retirementId: r.id, decision: 'approve', note: decideNote }
+      }))
+    })
+    await reload()
+    await orchestration.reload()
+    const jobItems = orchestration.itemsOf(enqueue.job.id)
+    const results = jobItems.map((it) => ({
+      id: it.payload.retirementId,
+      status: it.status === ITEM.SUCCEEDED ? 'ok'
+        : it.status === ITEM.SKIPPED ? 'changed'
+        : (it.errorCode || 'failed'),
+      title: it.title
+    }))
+    const done = jobItems.filter((x) => x.status === ITEM.SUCCEEDED).length
+    const failed = jobItems.filter((x) => x.status === ITEM.FAILED).length
+    return {
+      status: failed === 0 ? 'ok' : done > 0 ? 'partial' : 'failed',
+      job: enqueue.job, items: jobItems, results, done,
+      failed, skipped: jobItems.filter((x) => x.status === ITEM.SKIPPED).length
+    }
+  }
+
+  // 批量撤销已生效退役（可重试分批编排）：逐篇独立事务调用 revokeRetirement——
+  // 单篇失败（被另行处理/状态变化）不回滚其他篇；成功篇恢复搜索引用/共享链接/答案来源，
+  // 已被另行处理的篇返回 changed → 作业标记 skipped。中断后续跑、失败篇可单独重试。
+  // 兼容旧返回：{ status:'ok', results, done, failed, job? }
   async function revokeRetirementBatch(batchId, note, currentUser) {
+    const { useOrchestrationStore } = await import('./orchestration')
+    const orchestration = useOrchestrationStore()
     await loadAll()
     const userId = currentUser?.id || GUEST_ID
     const role = currentUser?.role || null
@@ -653,12 +793,44 @@ export const useRetirementStore = defineStore('retirement', () => {
     if (batch.initiatedBy !== userId && role !== ROLE.ADMIN) return { status: 'denied' }
     const targets = itemsOfBatch(batchId).filter((r) => isRetirementActive(r))
     if (!targets.length) return { status: 'changed', results: [] }
-    const results = []
-    for (const r of targets) {
-      // 逐篇独立事务：某篇撤销失败不回滚其他篇（与逐篇批准的独立性一致）
-      results.push(await revokeRetirement(r.id, note, currentUser))
+    const revokeNote = String(note || '').trim()
+
+    const enqueue = await orchestration.enqueueAndRun({
+      module: 'retirement',
+      action: 'batch-revoke',
+      refId: batchId,
+      refType: 'retirementBatch',
+      title: '批量撤销退役（逐篇恢复）',
+      note: revokeNote,
+      createdBy: userId,
+      actor: currentUser || null,
+      setupPayload: { batchId, userId, note: revokeNote },
+      items: targets.map((r) => ({
+        key: r.id,
+        entityId: r.docId,
+        title: r.docTitle,
+        payload: { retirementId: r.id, note: revokeNote }
+      }))
+    })
+    await reload()
+    await orchestration.reload()
+    const jobItems = orchestration.itemsOf(enqueue.job.id)
+    const results = jobItems.map((it) => ({
+      id: it.payload.retirementId,
+      status: it.status === ITEM.SUCCEEDED ? 'ok'
+        : it.status === ITEM.SKIPPED ? 'changed'
+        : (it.errorCode || 'failed'),
+      title: it.title
+    }))
+    return {
+      status: 'ok',
+      job: enqueue.job,
+      items: jobItems,
+      results,
+      done: jobItems.filter((x) => x.status === ITEM.SUCCEEDED).length,
+      failed: jobItems.filter((x) => x.status === ITEM.FAILED).length,
+      skipped: jobItems.filter((x) => x.status === ITEM.SKIPPED).length
     }
-    return { status: 'ok', results, done: results.filter((x) => x.status === 'ok').length, failed: results.filter((x) => x.status !== 'ok').length }
   }
 
   // 我发起的批次
@@ -682,7 +854,123 @@ export const useRetirementStore = defineStore('retirement', () => {
     batchesInitiatedBy, batchesInvolvedIn,
     initiateRetirement, initiateRetirementBatch,
     cancelRetirement, cancelRetirementBatch,
-    decideRetirement,
-    revokeRetirement, revokeRetirementBatch
+    decideRetirement, decideRetirementBatch,
+    revokeRetirement, revokeRetirementBatch,
+    runBatchSubmitItem
+  }
+})
+
+// ---- 可重试分批编排处理器注册（模块加载即注册，测试/应用均生效）----
+// 处理器需复用 store 动作（逐篇事务逻辑只保留一处），通过动态 import 避免循环依赖。
+async function retirementStore() {
+  return useRetirementStore()
+}
+
+// setup：作业与退役批次在同一事务原子建档（仅送审需要；批准/撤销的批次已存在）
+async function setupRetirementBatch({ job, items, tx, batchId, batchNote, userId }) {
+  const now = new Date().toISOString()
+  const batch = {
+    id: batchId,
+    status: RETIRE_BATCH.ACTIVE,
+    initiatedBy: userId,
+    total: items.length,
+    note: batchNote || '',
+    docIds: items.map((it) => it.payload.docId),
+    jobId: job.id,
+    createdAt: now,
+    updatedAt: now,
+    resolvedAt: null,
+    timeline: [buildTimelineEntry('initiate', userId,
+      '编排送审建档 ' + items.length + ' 篇（作业 ' + job.id + '）' + (batchNote ? '：' + batchNote : ''), now)]
+  }
+  await tx.retirementBatches.add(batch)
+}
+
+// afterFinish：作业终态后在同一事务回写退役批次派生状态与批次时间线（全链路留痕，
+// 编排作业与退役批次状态不可能不一致）
+async function traceRetirementBatchFinish({ job, items, userId, now }) {
+  const batch = await db.retirementBatches.get(job.refId)
+  if (!batch) return
+  const retirements = await db.retirements.where('batchId').equals(batch.id).toArray()
+  const status = retirementBatchStatusOf(retirements)
+  const succeeded = items.filter((x) => x.status === ITEM.SUCCEEDED).length
+  const failed = items.filter((x) => x.status === ITEM.FAILED).length
+  const skipped = items.filter((x) => x.status === ITEM.SKIPPED).length
+  const actionByJob = {
+    'batch-submit': 'batch-job',
+    'batch-approve': 'batch-approve-all',
+    'batch-revoke': 'batch-revoke-all'
+  }
+  const verb = {
+    'batch-submit': '送审',
+    'batch-approve': '批量批准',
+    'batch-revoke': '批量撤销恢复'
+  }[job.action]
+  batch.status = status
+  batch.total = retirements.length
+  batch.updatedAt = now
+  if (status !== RETIRE_BATCH.ACTIVE && !batch.resolvedAt) batch.resolvedAt = now
+  if (status === RETIRE_BATCH.ACTIVE) batch.resolvedAt = null
+  batch.timeline = [...(batch.timeline || []), buildTimelineEntry(
+    actionByJob[job.action] || 'batch-job',
+    userId,
+    '编排作业「' + verb + '」结束：成功 ' + succeeded + ' / 失败 ' + failed + ' / 跳过 ' + skipped +
+      '（作业 ' + job.id + '）',
+    now
+  )]
+  await db.retirementBatches.put(batch)
+}
+
+// 续跑/重试时执行上下文可能未携带完整 actor（仅 userId）：从 users 表还原角色，
+// 保证单篇事务内的资格复核（仅管理员可批准、发起人/管理员可撤销）在断点续跑时同样生效。
+async function actorOf(ctx) {
+  if (ctx.actor?.id === ctx.userId && ctx.actor?.role) return ctx.actor
+  const u = await db.users.get(ctx.userId)
+  return { id: ctx.userId, role: u?.role || null }
+}
+
+registerBatchHandler({
+  module: 'retirement',
+  action: 'batch-submit',
+  setupTables: () => [db.users, db.docs, db.retirements, db.retirementBatches, db.reviews, db.handovers],
+  setup: setupRetirementBatch,
+  afterFinish: traceRetirementBatchFinish,
+  runItem: async (item, ctx) => {
+    const store = await retirementStore()
+    const actor = await actorOf(ctx)
+    return store.runBatchSubmitItem(item, { ...ctx, actor })
+  }
+})
+
+registerBatchHandler({
+  module: 'retirement',
+  action: 'batch-approve',
+  setupTables: () => [
+    db.users, db.docs, db.retirements, db.retirementBatches, db.shares, db.gapTickets, db.reviews, db.handovers
+  ],
+  afterFinish: traceRetirementBatchFinish,
+  runItem: async (item, ctx) => {
+    const store = await retirementStore()
+    // 逐篇复用既有单篇审批事务（停引用/撤链接/改挂工单在同事务）；
+    // 操作者沿用真实身份（decideRetirement 内部校验仅管理员），不凭作业身份提权
+    const actor = await actorOf(ctx)
+    return store.decideRetirement(
+      item.payload.retirementId, 'approve', item.payload.note || '', actor
+    )
+  }
+})
+
+registerBatchHandler({
+  module: 'retirement',
+  action: 'batch-revoke',
+  setupTables: () => [db.users, db.docs, db.retirements, db.retirementBatches, db.shares, db.gapTickets],
+  afterFinish: traceRetirementBatchFinish,
+  runItem: async (item, ctx) => {
+    const store = await retirementStore()
+    // 逐篇复用既有单篇撤销恢复事务；操作者沿用真实身份（发起人本人或管理员）
+    const actor = await actorOf(ctx)
+    return store.revokeRetirement(
+      item.payload.retirementId, item.payload.note || '', actor
+    )
   }
 })

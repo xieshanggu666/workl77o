@@ -111,18 +111,26 @@ async function submit() {
     if (res.status === 'guest') { alert('请先登录后再发起批量退役。'); return }
     if (res.status === 'no-docs') { alert('请至少添加一篇要退役的文档。'); return }
     if (res.status === 'invalid') {
-      // 事务内权威校验：逐行回填错误，整体未产生任何退役单
+      // 事务内权威预检：逐行回填错误，全部行均不合法时不产生任何退役单
       const byDoc = Object.fromEntries(res.rows.map((x) => [x.docId, x]))
       for (const row of filledRows.value) {
         const sv = byDoc[row.docId]
         row.error = sv?.error || null
       }
-      alert('统一送审未通过：已按行标出原因，修正后可重新提交（本次未产生任何退役单）。')
+      alert('统一送审预检未通过：已按行标出原因，修正后可重新提交（本次未产生任何退役单）。')
       await nextTick()
       return
     }
-    if (res.status === 'ok') {
-      alert('已统一送审 ' + res.retirements.length + ' 篇退役申请，等待管理员逐篇审批。')
+    if (res.status === 'ok' || res.status === 'partial') {
+      const failedCount = res.items?.filter((x) => x.status === 'failed').length || 0
+      const invalidCount = res.invalid?.length || 0
+      if (res.status === 'partial' || failedCount) {
+        alert('已通过编排作业送审 ' + res.retirements.length + ' 篇；' +
+          (invalidCount ? '预检拦截 ' + invalidCount + ' 篇、' : '') +
+          '执行中 ' + failedCount + ' 篇因并发冲突被隔离，可在退役中心该批次下方的作业面板解除冲突后续跑重试。')
+      } else {
+        alert('已统一送审 ' + res.retirements.length + ' 篇退役申请，等待管理员逐篇/批量审批。')
+      }
       emit('submitted', res)
       emit('close')
     } else {

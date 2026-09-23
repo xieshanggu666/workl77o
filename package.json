@@ -17,7 +17,8 @@
     "test:policy-migration": "mkdir -p node_modules/.cache && esbuild scripts/run-policy-migration-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/policy-migration-test.mjs --alias:@=./src && node node_modules/.cache/policy-migration-test.mjs",
     "test:handover": "mkdir -p node_modules/.cache && esbuild scripts/run-handover-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/handover-test.mjs --alias:@=./src && node node_modules/.cache/handover-test.mjs",
     "test:retirement": "mkdir -p node_modules/.cache && esbuild scripts/run-retirement-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/retirement-test.mjs --alias:@=./src && node node_modules/.cache/retirement-test.mjs",
-    "test:retirement-batch": "mkdir -p node_modules/.cache && esbuild scripts/run-retirement-batch-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/retirement-batch-test.mjs --alias:@=./src && node node_modules/.cache/retirement-batch-test.mjs"
+    "test:retirement-batch": "mkdir -p node_modules/.cache && esbuild scripts/run-orchestration-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/orchestration-test.mjs --alias:@=./src && node node_modules/.cache/orchestration-test.mjs",
+    "test:orchestration": "mkdir -p node_modules/.cache && esbuild scripts/run-orchestration-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/orchestration-test.mjs --alias:@=./src && node node_modules/.cache/orchestration-test.mjs"
   },
   "dependencies": {
     "dexie": "^4.0.8",

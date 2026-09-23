@@ -90,6 +90,15 @@ export class KnowledgeDB extends Dexie {
       retirements: 'id, status, docId, replacementDocId, initiatedBy, decidedBy, createdAt, decidedAt, batchId',
       retirementBatches: 'id, initiatedBy, createdAt'
     })
+    // v12：可重试分批编排
+    // - batchJobs：批量联动操作（批量退役生效、批量撤销恢复）的编排作业——逐篇独立事务，
+    //   单篇失败仅回滚该篇（冲突隔离）；作业/篇状态、心跳租约、中止标志、逐次尝试结果全程入库，
+    //   中断后凭心跳续跑、失败篇外部条件解除后可只重试失败篇（部分失败续跑，避免跨文档状态不一致）。
+    // - batchJobItems：作业内逐篇记录（业务载荷、状态、attempts），随作业原子建档。
+    this.version(12).stores({
+      batchJobs: 'id, module, action, refId, status, createdAt, heartbeatAt',
+      batchJobItems: 'id, jobId, status, entityId, [jobId+index]'
+    })
   }
 }
 

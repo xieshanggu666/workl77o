@@ -122,7 +122,11 @@ export function retireTimelineLabel(action) {
     'share-revoke': '共享链接随退役批量撤销',
     // 撤销退役时的联动结果
     'gap-restore': '答案来源回挂旧文档',
-    'share-restore': '共享链接随撤销退役恢复'
+    'share-restore': '共享链接随撤销退役恢复',
+    // 编排作业（可重试分批编排）
+    'batch-job': '分批编排作业',
+    'batch-approve-all': '批量批准编排',
+    'batch-revoke-all': '批量撤销恢复编排'
   }[action] || action
 }
 

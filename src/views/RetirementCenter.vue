@@ -3,16 +3,19 @@ import { ref, computed, onMounted } from 'vue'
 import { useKbStore } from '@/stores/kb'
 import { useAuthStore } from '@/stores/auth'
 import { useRetirementStore } from '@/stores/retirement'
+import { useOrchestrationStore } from '@/stores/orchestration'
 import { formatDate, formatFull } from '@/utils/format'
 import {
   RETIRE_BATCH, retirementBatchStatusLabel, retirementBatchProgress, isRetirementActive
 } from '@/utils/retirement'
 import RetirementCard from '@/components/doc/RetirementCard.vue'
 import RetirementBatchDialog from '@/components/doc/RetirementBatchDialog.vue'
+import BatchJobPanel from '@/components/doc/BatchJobPanel.vue'
 
 const kb = useKbStore()
 const auth = useAuthStore()
 const retirementStore = useRetirementStore()
+const orchestrationStore = useOrchestrationStore()
 
 const tab = ref('approve') // approve | mine | all
 const showBatchDialog = ref(false)
@@ -97,18 +100,38 @@ async function cancelBatch(batch) {
   }
 }
 
+async function approveBatch(batch) {
+  if (batchBusy.value) return
+  const pendingCount = retirementStore.itemsOfBatch(batch.id).filter((r) => r.status === 'pending').length
+  if (!pendingCount) { alert('该批次已无待审批篇。'); return }
+  if (!confirm('对该批次的 ' + pendingCount + ' 篇待审批退役执行批量批准？\n将逐篇在独立事务中停止搜索/问答引用、撤销共享链接、改挂缺口答案来源；\n某篇存在并发冲突时仅隔离该篇，其余篇正常生效，失败篇可在下方作业面板续跑重试。')) return
+  batchBusy.value = batch.id
+  try {
+    const res = await retirementStore.decideRetirementBatch(batch.id, '', auth.user)
+    if (res.status === 'denied') alert('只有管理员可以批量批准。')
+    else if (res.status === 'changed') alert('该批次已无待审批篇。')
+    else if (res.status === 'guest') alert('请先登录。')
+    else alert('批量批准结束：成功 ' + res.done + ' 篇' +
+      (res.failed ? '，' + res.failed + ' 篇因冲突未生效（可在批次下方作业面板续跑重试）' : '') +
+      (res.skipped ? '，' + res.skipped + ' 篇状态已变化跳过' : ''))
+  } finally {
+    batchBusy.value = ''
+  }
+}
+
 async function revokeBatch(batch) {
   if (batchBusy.value) return
   const activeCount = retirementStore.itemsOfBatch(batch.id).filter((r) => isRetirementActive(r)).length
   if (!activeCount) { alert('该批次已无生效中的退役。'); return }
-  if (!confirm('确定批量撤销该批次的 ' + activeCount + ' 篇已生效退役？将逐篇恢复搜索/问答引用、共享链接与答案来源（单篇被另行处理时不影响其他篇）。')) return
+  if (!confirm('确定批量撤销该批次的 ' + activeCount + ' 篇已生效退役？将逐篇在独立事务中恢复搜索/问答引用、共享链接与答案来源（单篇被另行处理时跳过该篇，不影响其他篇；失败可续跑重试）。')) return
   batchBusy.value = batch.id
   try {
     const res = await retirementStore.revokeRetirementBatch(batch.id, (batchNoteMap.value[batch.id] || '').trim(), auth.user)
-    if (res.status === 'ok') alert('批量撤销完成：成功 ' + res.done + ' 篇' + (res.failed ? '，' + res.failed + ' 篇因状态变化未撤销' : ''))
-    else if (res.status === 'denied') alert('只有批次发起人或管理员可以批量撤销。')
+    if (res.status === 'denied') alert('只有批次发起人或管理员可以批量撤销。')
     else if (res.status === 'changed') alert('该批次已无生效中的退役。')
-    else alert('操作失败')
+    else alert('批量撤销结束：成功 ' + res.done + ' 篇' +
+      (res.failed ? '，' + res.failed + ' 篇未撤销（可续跑重试）' : '') +
+      (res.skipped ? '，' + res.skipped + ' 篇状态已变化跳过' : ''))
   } finally {
     batchBusy.value = ''
   }
@@ -119,7 +142,7 @@ function onBatchSubmitted() {
 }
 
 onMounted(async () => {
-  await Promise.all([kb.loadAll(), auth.loadUsers(), retirementStore.loadAll()])
+  await Promise.all([kb.loadAll(), auth.loadUsers(), retirementStore.loadAll(), orchestrationStore.loadAll()])
   if (approveList.value.length) tab.value = 'approve'
   else tab.value = 'mine'
 })
@@ -164,6 +187,10 @@ onMounted(async () => {
           <div class="bg-meta">
             <span>{{ userName(g.batch.initiatedBy) }} 发起 · {{ formatDate(g.batch.createdAt) }}</span>
             <div v-if="canManageBatch(g.batch)" class="bg-acts">
+              <button v-if="progressOf(g.items).pending && auth.user?.role === 'admin'"
+                      class="btn xs primary" :disabled="batchBusy === g.batch.id" @click="approveBatch(g.batch)">
+                批量批准待审批篇（{{ progressOf(g.items).pending }}）
+              </button>
               <button v-if="progressOf(g.items).pending" class="btn xs ghost" :disabled="batchBusy === g.batch.id" @click="cancelBatch(g.batch)">整体取消待审批篇</button>
               <template v-if="progressOf(g.items).approved">
                 <input v-model="batchNoteMap[g.batch.id]" class="bg-note" placeholder="批量撤销说明（可选）" />
@@ -194,6 +221,8 @@ onMounted(async () => {
             <span class="tl-tm">{{ formatFull(t.at) }}</span>
           </div>
         </details>
+
+        <BatchJobPanel :ref-id="g.batch.id" />
       </section>
 
       <!-- 独立单篇退役单（无批次，含历史单篇记录） -->
